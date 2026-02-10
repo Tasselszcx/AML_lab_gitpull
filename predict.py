@@ -5,7 +5,7 @@ import time
 from collections import deque
 
 # --- Configuration ---
-SERIAL_PORT = 'COM3'  # Windows: usually COMx; Mac/Linux: /dev/ttyUSBx
+SERIAL_PORT = 'COM6'  # Windows: usually COMx; Mac/Linux: /dev/ttyUSBx
 BAUD_RATE = 115200
 WINDOW_SIZE = 50      # MUST match the window size used in training
 ID_TO_ACTION = {0: "Idle", 1: "Blink", 2: "Left", 3: "Right", 4: "Up", 5: "Down"}
@@ -48,7 +48,8 @@ def main():
         
         while True:
             if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8').strip()
+                # 添加 errors='ignore' 来跳过无法解码的乱码字节
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if not line: continue
                 
                 try:
