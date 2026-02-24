@@ -11,7 +11,7 @@ from datetime import datetime
 
 # ================= 配置区域 =================
 # 1. 修改为你的 Arduino 端口号 (Windows: 'COM3', Mac: '/dev/cu.usbmodem...')
-SERIAL_PORT = 'COM6' 
+SERIAL_PORT = 'COM3' 
 
 # 2. 波特率必须与 Arduino 代码一致
 BAUD_RATE = 115200
