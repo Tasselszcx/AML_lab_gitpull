@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include "USB.h"
 #include "USBHIDMouse.h"
-#include "model.h" 
+#include "EOG_AI_Engine.h" 
 
 Eloquent::ML::Port::RandomForest classifier; 
 USBHIDMouse Mouse;
