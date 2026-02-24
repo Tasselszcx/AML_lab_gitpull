@@ -15,6 +15,7 @@ BAUD_RATE = 115200
 MODEL_PATH = "main_project/models/models_xkp/eog_model_v4.joblib"
 SCALER_PATH = "main_project/models/models_xkp/eog_scaler_v4.joblib"
 
+
 SAMPLING_RATE = 50
 WINDOW_SIZE = 50           
 DISPLAY_LEN = 300          
@@ -42,11 +43,11 @@ class EOGSystem:
             print(f"❌ 模型加载失败: {e}")
             sys.exit(1)
 
-        # 绘图缓冲区 (存储原始数据 Raw Data)
-        self.plot_h = deque([512]*DISPLAY_LEN, maxlen=DISPLAY_LEN) # 默认512居中
-        self.plot_v = deque([512]*DISPLAY_LEN, maxlen=DISPLAY_LEN)
+        # 绘图缓冲区 (GUI读取)
+        self.plot_h = deque([0]*DISPLAY_LEN, maxlen=DISPLAY_LEN)
+        self.plot_v = deque([0]*DISPLAY_LEN, maxlen=DISPLAY_LEN)
         
-        # 算法缓冲区 (存储用于计算的数据)
+        # 算法缓冲区 (仅串口线程使用，不需要锁)
         self.raw_buffer = deque(maxlen=FILTER_BUFFER_SIZE)
         
         # 状态变量
@@ -57,9 +58,12 @@ class EOGSystem:
         self.detected_frame_idx = -999 
 
     def apply_realtime_filter(self, window_data):
+        # 滤波器参数预计算 (为了提速，也可以放在init里)
         fs = 50.0 
         nyq = 0.5 * fs
         b, a = scipy_signal.butter(4, [0.5/nyq, 10.0/nyq], btype='band')
+        
+        # 沿轴0滤波
         return scipy_signal.filtfilt(b, a, window_data, axis=0)
 
     def extract_features(self, window_data):
@@ -85,100 +89,94 @@ class EOGSystem:
         """
         self.frame_counter += 1
         
-        # 1. 存入算法缓冲区 (用于后续滤波计算)
+        # 1. 存入算法缓冲区
         self.raw_buffer.append([h_val, v_val])
-
-        # ==========================================
-        # 快速同步区域 (更新绘图数据 - 存原始值)
-        # ==========================================
-        with self.lock:
-            # 直接把原始数据存进去，不经过滤波
-            self.plot_h.append(h_val)
-            self.plot_v.append(v_val)
         
-        # 缓冲区未满时，不进行推理，直接返回
         if len(self.raw_buffer) < FILTER_BUFFER_SIZE:
             return
 
         # ==========================================
-        # 耗时计算区域 (完全在锁外面进行！)
+        # 耗时计算区域
         # ==========================================
         
-        # A. 滤波 (仅用于模型推理，不影响画图)
+        # A. 滤波
         long_window = np.array(self.raw_buffer)
         filtered_long = self.apply_realtime_filter(long_window)
+        newest_sample = filtered_long[-1]
         
-        # B. 推理
-        pred_label = "Rest"
-        confidence = 0.0
+        # B. 准备特征
+        final_window = filtered_long[-WINDOW_SIZE:] 
+        feats = self.extract_features(final_window)
         
-        # 冷却逻辑
+        # 获取垂直通道最大速度 (Index 13)
+        v_velocity = feats[0][13]
+        
+        # C. 模型预测
+        feats_scaled = self.scaler.transform(feats)
+        probs = self.model.predict_proba(feats_scaled)[0]
+        pred_idx = np.argmax(probs)
+        raw_label = CLASSES[pred_idx] # 这是模型原始的判断
+        conf = probs[pred_idx]
+
+        # 最终决定的标签
+        final_label = "Rest"
+        
+        # =========================================================
+        # 🧠 核心修改：基于你提供的速度数据 (Up~55, Blink~25)
+        # =========================================================
+        
+        # 速度阈值设定 (取 30 和 55 的中间值)
+        VELOCITY_THRESHOLD_HIGH = 42.0 
+        VELOCITY_THRESHOLD_LOW  = 35.0
+
+        if conf > CONFIDENCE_THRESHOLD and raw_label != "Rest":
+            
+            # --- 规则 1: 回弹抑制 (Anti-Rebound) ---
+            # 如果上一次动作是 Up/Down，且距离现在不到 0.5 秒 (25帧)
+            # 那么现在的任何信号都可能是回正产生的，忽略它
+            frames_since_last = self.frame_counter - self.detected_frame_idx
+            
+            if self.last_pred in ["Up", "Down"] and frames_since_last < 25:
+                print(f"🛡️ 忽略回弹余波 (上个动作: {self.last_pred})")
+                final_label = "Rest"
+            
+            else:
+                # --- 规则 2: 速度修正 (根据你的实测数据) ---
+                
+                # 情况 A: 模型说是 Blink，但速度太快 (>42) -> 肯定是 Up
+                if raw_label == "Blink" and v_velocity > VELOCITY_THRESHOLD_HIGH:
+                    print(f"🚀 速度极快 ({v_velocity:.1f})，修正 Blink -> Up")
+                    final_label = "Up"
+                    
+                # 情况 B: 模型说是 Up/Down，但速度太慢 (<35) -> 肯定是 Blink
+                elif (raw_label in ["Up", "Down"]) and v_velocity < VELOCITY_THRESHOLD_LOW:
+                    print(f"🐌 速度较慢 ({v_velocity:.1f})，修正 {raw_label} -> Blink")
+                    final_label = "Blink"
+                    
+                # 情况 C: 其他情况，相信模型
+                else:
+                    final_label = raw_label
+
+        # =========================================================
+
+        # 冷却期间强制 Rest
         if self.cooldown > 0:
             self.cooldown -= 1
-        else:
-            final_window = filtered_long[-WINDOW_SIZE:]
-            feats = self.extract_features(final_window)
-            
-            # 获取垂直特征辅助判断
-            v_velocity = feats[0][13]
-            v_max = feats[0][10]
-            v_min = feats[0][11]
-            
-            feats_scaled = self.scaler.transform(feats)
-            probs = self.model.predict_proba(feats_scaled)[0]
-            pred_idx = np.argmax(probs)
-            raw_label = CLASSES[pred_idx]
-            conf = probs[pred_idx]
-            
             final_label = "Rest"
-            VELOCITY_THRESHOLD_HIGH = 42.0 
-            VELOCITY_THRESHOLD_LOW  = 35.0
 
-            if conf > CONFIDENCE_THRESHOLD and raw_label != "Rest":
-                # --- 规则修正逻辑 (保持不变) ---
-                frames_since_last = self.frame_counter - self.detected_frame_idx
-                if self.last_pred in ["Up", "Down"] and raw_label == "Blink" and frames_since_last < 30:
-                    print(f"🛡️ 忽略回弹 Blink")
-                    final_label = "Rest"
-                else:
-                    if raw_label == "Up" and v_velocity < VELOCITY_THRESHOLD_LOW:
-                        print(f"🐌 Up速度慢 -> 改 Blink")
-                        final_label = "Blink"
-                    elif raw_label == "Blink" and v_velocity > VELOCITY_THRESHOLD_HIGH:
-                        if v_max > abs(v_min): 
-                            print(f"🚀 Blink速度快 -> 改 Up")
-                            final_label = "Up"
-                        else:
-                            final_label = "Blink"
-                    elif raw_label == "Down":
-                        if v_max > abs(v_min) * 1.5:
-                            print(f"⚠️ Down 极性不符 -> 改 Blink")
-                            final_label = "Blink"
-                        else:
-                            final_label = "Down"
-                    elif raw_label == "Blink":
-                        if abs(v_min) > v_max * 1.5:
-                             print(f"⚠️ Blink 极性不符 -> 改 Down")
-                             final_label = "Down"
-                        else:
-                             final_label = "Blink"
-                    else:
-                        final_label = raw_label
+        # 快速同步区域 (更新状态)
+        with self.lock:
+            self.plot_h.append(newest_sample[0])
+            self.plot_v.append(newest_sample[1])
             
-                if final_label != "Rest":
-                    pred_label = final_label
-                    confidence = conf
-
-        # ==========================================
-        # 再次同步 (更新检测状态)
-        # ==========================================
-        if pred_label != "Rest":
-            with self.lock:
-                self.last_pred = pred_label
-                self.last_conf = confidence
+            if final_label != "Rest":
+                self.last_pred = final_label
+                self.last_conf = conf
                 self.cooldown = COOLDOWN_FRAMES
                 self.detected_frame_idx = self.frame_counter
-                print(f"⚡ 检测到: {pred_label} ({confidence:.2f})")
+                
+                # 打印调试信息，确认修正是否生效
+                print(f"⚡ 最终判定: {final_label} (原判:{raw_label} | Vel:{v_velocity:.1f})")
 
 # ================= 3. 串口线程 =================
 
@@ -200,15 +198,19 @@ def serial_thread(system):
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if not line: continue
                 
+                # 兼容逗号和制表符
                 parts = line.replace(',', '\t').split('\t')
+                
                 if len(parts) >= 2:
                     try:
-                        # 解析原始字符串
+                        # ==== 修改开始: 去除标签 ====
+                        # 你的 Arduino 发送的是 "H:512.00", 我们需要把 "H:" 删掉
                         str_h = parts[0].strip().replace("H:", "").replace("V:", "")
                         str_v = parts[1].strip().replace("H:", "").replace("V:", "")
                         
                         h_val = float(str_h) * GAIN_H
                         v_val = float(str_v) * GAIN_V
+                        # ==== 修改结束 ====
                         
                         # 调用处理函数
                         system.process_new_data(h_val, v_val)
@@ -216,6 +218,7 @@ def serial_thread(system):
                     except ValueError:
                         pass
             else:
+                # 极其重要：给CPU一点喘息时间，防止单核跑满导致GUI卡顿
                 time.sleep(0.001) 
                 
         except Exception as e:
@@ -237,36 +240,38 @@ def main():
     # 设置图表风格
     plt.style.use('seaborn-v0_8-darkgrid' if 'seaborn-v0_8-darkgrid' in plt.style.available else 'fast')
     
-    # 只创建一个子图 (1, 1)
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    # ⬇️⬇️⬇️ 修改开始：只创建一个子图 (1, 1) ⬇️⬇️⬇️
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6)) # 高度可以稍微改小一点，因为只有一行了
+    # plt.subplots_adjust(hspace=0.2) # 不需要调整间距了，因为只有一个图
     
     # --- 在同一个 ax 上画两条线 ---
     # 1. 水平信号 (蓝色)
     line_h, = ax.plot([], [], label='Horizontal (L/R)', color='#1f77b4', lw=1.5, alpha=0.9)
     
     # 2. 垂直信号 (橙色)
-    line_v, = ax.plot([], [], label='Vertical (U/D)', color='#ff7f0e', lw=1.5, alpha=0.8)
+    line_v, = ax.plot([], [], label='Vertical (U/D)', color='#ff7f0e', lw=1.5, alpha=0.8) # 稍微透明一点防止完全遮挡
     
     # 状态文字
     text_status = ax.text(0.02, 0.90, "Initializing...", transform=ax.transAxes, 
                           fontsize=16, fontweight='bold', color='gray')
     
     # 红框 (显示检测窗口)
-    rect = plt.Rectangle((0, 0), WINDOW_SIZE, 1024, color='red', alpha=0.15, visible=False)
+    rect = plt.Rectangle((0, -200), WINDOW_SIZE, 400, color='red', alpha=0.15, visible=False)
     ax.add_patch(rect)
     
-    # 设置坐标轴 (Raw Data 范围通常是 0-1023)
+    # 设置坐标轴
     ax.set_xlim(0, DISPLAY_LEN)
-    ax.set_ylim(0, 1024)       # ⚠️ 针对 Arduino 10bit ADC 调整范围
-    ax.set_ylabel("Raw ADC Value")
+    ax.set_ylim(-200, 200)       # ⚠️ 如果波形重叠太乱，可以把范围调大，比如 (-300, 300)
+    ax.set_ylabel("Amplitude")
     ax.set_xlabel("Time (Samples)")
-    ax.set_title("Real-time EOG Analysis (Raw Data)")
+    ax.set_title("Real-time EOG Analysis (Combined)")
     
-    # 合并图例
+    # 合并图例 (显示在右上角)
     ax.legend(loc='upper right', frameon=True, fancybox=True, framealpha=0.8)
     ax.grid(True, alpha=0.3)
 
     x_data = np.arange(DISPLAY_LEN)
+    # ⬆️⬆️⬆️ 修改结束 ⬆️⬆️⬆️
 
     def update(frame):
         if not system.running: return
@@ -281,7 +286,7 @@ def main():
             last_pred = system.last_pred
             last_conf = system.last_conf
         
-        # 1. 更新线条
+        # 1. 更新线条 (都在同一个图里更新)
         line_h.set_data(x_data, data_h)
         line_v.set_data(x_data, data_v)
         
@@ -301,6 +306,7 @@ def main():
 
         return line_h, line_v, text_status, rect
 
+    # 启动动画
     ani = animation.FuncAnimation(fig, update, interval=30, blit=False, cache_frame_data=False)
     
     try:

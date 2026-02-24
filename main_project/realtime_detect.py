@@ -12,7 +12,7 @@ from scipy.stats import skew, kurtosis
 from numpy.fft import rfft, rfftfreq
 
 # ================= 配置区域 =================
-SERIAL_PORT = 'COM6'   # 请确认端口
+SERIAL_PORT = 'COM3'   # 请确认端口
 BAUD_RATE = 115200
 MODEL_PATH = "models/rf_model.pkl"
 
