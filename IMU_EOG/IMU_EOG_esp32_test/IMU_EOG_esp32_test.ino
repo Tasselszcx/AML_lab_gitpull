@@ -5,7 +5,7 @@ const int PIN_EOG_H = A0;
 const int PIN_EOG_V = A1;
 
 // IMU 的 I2C 地址 (ICM20600 通常是 0x68 或 0x69)
-uint8_t imu_address = 0x68; 
+uint8_t imu_address = 0x69; 
 bool imu_found = false;
 
 void setup() {
