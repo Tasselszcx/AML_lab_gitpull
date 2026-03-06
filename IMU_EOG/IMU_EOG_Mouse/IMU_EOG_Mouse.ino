@@ -7,7 +7,7 @@
 #include <Wire.h>
 #include "USB.h"
 #include "USBHIDMouse.h"
-#include "EOG_AI_Engine_esp32.h" 
+#include "EOG_AI_Engine_esp32_multi.h" 
 
 // ==== 1. 硬件与引脚 ====
 USBHIDMouse Mouse;
