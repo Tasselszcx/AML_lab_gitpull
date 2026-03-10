@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+virtual/
+virtual1/
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Project specific
+cw_20251120/
+IMU_EOG/demo case/
+IMU_EOG/output/
+*.pptx
+*.docx
+*.pdf
+*.mp4
+*.avi
+
+# Temporary files
+*.tmp
+*.log
